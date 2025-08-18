@@ -22,6 +22,7 @@
 (define-data-var claim-counter uint u0)
 (define-data-var total-locked-funds uint u0)
 (define-data-var oracle-address (optional principal) none)
+(define-data-var refund-rate uint u25)
 
 (define-map policies
   { policy-id: uint }
@@ -61,6 +62,11 @@
 (define-map authorized-oracles
   { oracle: principal }
   { active: bool }
+)
+
+(define-map refund-balances
+  { user: principal }
+  { refund-amount: uint }
 )
 
 (define-public (set-oracle (oracle principal))
@@ -246,7 +252,10 @@
     (asserts! (is-eq (get status policy) policy-status-active) err-invalid-policy)
     
     (if (and delivered on-time)
-      (expire-policy policy-id)
+      (begin
+        (try! (process-successful-delivery policy-id))
+        (expire-policy policy-id)
+      )
       (begin
         (unwrap-panic (if (not delivered)
           (auto-claim policy-id u1 (get coverage-amount policy))
@@ -288,6 +297,44 @@
     
     (var-set total-locked-funds (- (var-get total-locked-funds) amount))
     (ok claim-id)
+  )
+)
+
+(define-private (process-successful-delivery (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (premium-info (unwrap! (map-get? policy-premiums { policy-id: policy-id }) err-not-found))
+      (refund-amount (/ (* (get locked-amount premium-info) (var-get refund-rate)) u100))
+      (current-refund (default-to u0 (get refund-amount (map-get? refund-balances { user: (get shipper policy) }))))
+    )
+    (map-set refund-balances 
+      { user: (get shipper policy) }
+      { refund-amount: (+ current-refund refund-amount) }
+    )
+    (ok refund-amount)
+  )
+)
+
+(define-public (set-refund-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u100) err-invalid-policy)
+    (var-set refund-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-public (withdraw-refund)
+  (let
+    (
+      (user-refund (unwrap! (map-get? refund-balances { user: tx-sender }) err-not-found))
+      (refund-amount (get refund-amount user-refund))
+    )
+    (asserts! (> refund-amount u0) err-not-found)
+    (try! (as-contract (stx-transfer? refund-amount tx-sender tx-sender)))
+    (map-delete refund-balances { user: tx-sender })
+    (ok refund-amount)
   )
 )
 
@@ -335,4 +382,12 @@
     policy (> stacks-block-height (get end-block policy))
     true
   )
+)
+
+(define-read-only (get-refund-balance (user principal))
+  (map-get? refund-balances { user: user })
+)
+
+(define-read-only (get-refund-rate)
+  (var-get refund-rate)
 )
