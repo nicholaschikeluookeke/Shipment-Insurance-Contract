@@ -8,6 +8,7 @@
 (define-constant err-unauthorized (err u106))
 (define-constant err-policy-active (err u107))
 (define-constant err-invalid-oracle (err u108))
+(define-constant err-invalid-tier (err u109))
 
 (define-constant policy-status-active u1)
 (define-constant policy-status-claimed u2)
@@ -18,11 +19,17 @@
 (define-constant claim-status-approved u2)
 (define-constant claim-status-rejected u3)
 
+(define-constant tier-bronze u1)
+(define-constant tier-silver u2)
+(define-constant tier-gold u3)
+(define-constant tier-platinum u4)
+
 (define-data-var policy-counter uint u0)
 (define-data-var claim-counter uint u0)
 (define-data-var total-locked-funds uint u0)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var refund-rate uint u25)
+(define-data-var max-discount-rate uint u30)
 
 (define-map policies
   { policy-id: uint }
@@ -69,11 +76,67 @@
   { refund-amount: uint }
 )
 
+(define-map user-loyalty-stats
+  { user: principal }
+  {
+    successful-deliveries: uint,
+    total-policies: uint,
+    total-premium-paid: uint,
+    current-tier: uint,
+    last-updated: uint
+  }
+)
+
+(define-map discount-tiers
+  { tier: uint }
+  {
+    min-successful-deliveries: uint,
+    min-total-policies: uint,
+    discount-percentage: uint,
+    tier-name: (string-ascii 20)
+  }
+)
+
+(define-private (initialize-discount-tiers)
+  (begin
+    (map-set discount-tiers { tier: tier-bronze }
+      {
+        min-successful-deliveries: u0,
+        min-total-policies: u0,
+        discount-percentage: u0,
+        tier-name: "Bronze"
+      })
+    (map-set discount-tiers { tier: tier-silver }
+      {
+        min-successful-deliveries: u3,
+        min-total-policies: u5,
+        discount-percentage: u10,
+        tier-name: "Silver"
+      })
+    (map-set discount-tiers { tier: tier-gold }
+      {
+        min-successful-deliveries: u10,
+        min-total-policies: u15,
+        discount-percentage: u20,
+        tier-name: "Gold"
+      })
+    (map-set discount-tiers { tier: tier-platinum }
+      {
+        min-successful-deliveries: u25,
+        min-total-policies: u30,
+        discount-percentage: u30,
+        tier-name: "Platinum"
+      })
+    (ok true)
+  )
+)
+
 (define-public (set-oracle (oracle principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (var-set oracle-address (some oracle))
     (map-set authorized-oracles { oracle: oracle } { active: true })
+    (unwrap-panic (initialize-discount-tiers))
     (ok true)
   )
 )
@@ -92,9 +155,15 @@
       (coverage-amount (* shipment-value u110))
       (start-block stacks-block-height)
       (end-block (+ stacks-block-height coverage-duration))
+      (user-stats (default-to 
+        { successful-deliveries: u0, total-policies: u0, total-premium-paid: u0, current-tier: tier-bronze, last-updated: u0 }
+        (map-get? user-loyalty-stats { user: tx-sender })
+      ))
+      (discount-rate (get-user-discount tx-sender))
+      (discounted-premium (- premium-amount (/ (* premium-amount discount-rate) u100)))
     )
-    (asserts! (>= (stx-get-balance tx-sender) premium-amount) err-insufficient-premium)
-    (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+    (asserts! (>= (stx-get-balance tx-sender) discounted-premium) err-insufficient-premium)
+    (try! (stx-transfer? discounted-premium tx-sender (as-contract tx-sender)))
     
     (map-set policies
       { policy-id: policy-id }
@@ -114,11 +183,19 @@
     
     (map-set policy-premiums
       { policy-id: policy-id }
-      { locked-amount: premium-amount }
+      { locked-amount: discounted-premium }
+    )
+    
+    (map-set user-loyalty-stats { user: tx-sender }
+      (merge user-stats {
+        total-policies: (+ (get total-policies user-stats) u1),
+        total-premium-paid: (+ (get total-premium-paid user-stats) discounted-premium),
+        last-updated: stacks-block-height
+      })
     )
     
     (var-set policy-counter policy-id)
-    (var-set total-locked-funds (+ (var-get total-locked-funds) premium-amount))
+    (var-set total-locked-funds (+ (var-get total-locked-funds) discounted-premium))
     (ok policy-id)
   )
 )
@@ -307,12 +384,80 @@
       (premium-info (unwrap! (map-get? policy-premiums { policy-id: policy-id }) err-not-found))
       (refund-amount (/ (* (get locked-amount premium-info) (var-get refund-rate)) u100))
       (current-refund (default-to u0 (get refund-amount (map-get? refund-balances { user: (get shipper policy) }))))
+      (shipper (get shipper policy))
+      (user-stats (default-to 
+        { successful-deliveries: u0, total-policies: u0, total-premium-paid: u0, current-tier: tier-bronze, last-updated: u0 }
+        (map-get? user-loyalty-stats { user: shipper })
+      ))
+      (new-successful-deliveries (+ (get successful-deliveries user-stats) u1))
+      (new-tier (calculate-user-tier shipper new-successful-deliveries (get total-policies user-stats)))
     )
     (map-set refund-balances 
-      { user: (get shipper policy) }
+      { user: shipper }
       { refund-amount: (+ current-refund refund-amount) }
     )
+    (map-set user-loyalty-stats { user: shipper }
+      (merge user-stats {
+        successful-deliveries: new-successful-deliveries,
+        current-tier: new-tier,
+        last-updated: stacks-block-height
+      })
+    )
     (ok refund-amount)
+  )
+)
+
+(define-private (calculate-user-tier (user principal) (successful-deliveries uint) (total-policies uint))
+  (if (and (>= successful-deliveries u25) (>= total-policies u30))
+    tier-platinum
+    (if (and (>= successful-deliveries u10) (>= total-policies u15))
+      tier-gold
+      (if (and (>= successful-deliveries u3) (>= total-policies u5))
+        tier-silver
+        tier-bronze
+      )
+    )
+  )
+)
+
+(define-read-only (get-user-discount (user principal))
+  (let
+    (
+      (user-stats (map-get? user-loyalty-stats { user: user }))
+    )
+    (match user-stats
+      stats
+        (let ((tier-info (unwrap! (map-get? discount-tiers { tier: (get current-tier stats) }) u0)))
+          (get discount-percentage tier-info)
+        )
+      u0
+    )
+  )
+)
+
+(define-public (update-discount-tier (tier uint) (min-deliveries uint) (min-policies uint) (discount uint) (name (string-ascii 20)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= tier tier-bronze) (<= tier tier-platinum)) err-invalid-tier)
+    (asserts! (<= discount (var-get max-discount-rate)) err-invalid-policy)
+    (map-set discount-tiers { tier: tier }
+      {
+        min-successful-deliveries: min-deliveries,
+        min-total-policies: min-policies,
+        discount-percentage: discount,
+        tier-name: name
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-max-discount-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u50) err-invalid-policy)
+    (var-set max-discount-rate new-rate)
+    (ok true)
   )
 )
 
@@ -390,4 +535,38 @@
 
 (define-read-only (get-refund-rate)
   (var-get refund-rate)
+)
+
+(define-read-only (get-user-loyalty-stats (user principal))
+  (map-get? user-loyalty-stats { user: user })
+)
+
+(define-read-only (get-discount-tier-info (tier uint))
+  (map-get? discount-tiers { tier: tier })
+)
+
+(define-read-only (get-user-tier (user principal))
+  (match (map-get? user-loyalty-stats { user: user })
+    stats (some (get current-tier stats))
+    none
+  )
+)
+
+(define-read-only (calculate-discounted-premium (user principal) (base-premium uint))
+  (let
+    (
+      (discount-rate (get-user-discount user))
+      (discount-amount (/ (* base-premium discount-rate) u100))
+    )
+    {
+      original-premium: base-premium,
+      discount-rate: discount-rate,
+      discount-amount: discount-amount,
+      final-premium: (- base-premium discount-amount)
+    }
+  )
+)
+
+(define-read-only (get-max-discount-rate)
+  (var-get max-discount-rate)
 )
