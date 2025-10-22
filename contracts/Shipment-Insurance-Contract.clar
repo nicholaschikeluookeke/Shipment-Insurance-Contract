@@ -9,6 +9,9 @@
 (define-constant err-policy-active (err u107))
 (define-constant err-invalid-oracle (err u108))
 (define-constant err-invalid-tier (err u109))
+(define-constant err-notification-exists (err u110))
+(define-constant err-notification-not-found (err u111))
+(define-constant err-invalid-notification-type (err u112))
 
 (define-constant policy-status-active u1)
 (define-constant policy-status-claimed u2)
@@ -24,12 +27,21 @@
 (define-constant tier-gold u3)
 (define-constant tier-platinum u4)
 
+(define-constant notification-type-policy-created u1)
+(define-constant notification-type-policy-expired u2)
+(define-constant notification-type-claim-submitted u3)
+(define-constant notification-type-claim-approved u4)
+(define-constant notification-type-claim-rejected u5)
+(define-constant notification-type-delivery-confirmed u6)
+(define-constant notification-type-policy-cancelled u7)
+
 (define-data-var policy-counter uint u0)
 (define-data-var claim-counter uint u0)
 (define-data-var total-locked-funds uint u0)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var refund-rate uint u25)
 (define-data-var max-discount-rate uint u30)
+(define-data-var notification-counter uint u0)
 
 (define-map policies
   { policy-id: uint }
@@ -97,6 +109,36 @@
   }
 )
 
+(define-map stakeholder-subscriptions
+  { stakeholder: principal, policy-id: uint }
+  {
+    notification-types: (list 10 uint),
+    active: bool,
+    subscribed-at: uint
+  }
+)
+
+(define-map notifications
+  { notification-id: uint }
+  {
+    policy-id: uint,
+    notification-type: uint,
+    stakeholder: principal,
+    message: (string-ascii 100),
+    created-at: uint,
+    read: bool
+  }
+)
+
+(define-map stakeholder-roles
+  { stakeholder: principal }
+  {
+    role-type: (string-ascii 20),
+    verified: bool,
+    registered-at: uint
+  }
+)
+
 (define-private (initialize-discount-tiers)
   (begin
     (map-set discount-tiers { tier: tier-bronze }
@@ -127,6 +169,124 @@
         discount-percentage: u30,
         tier-name: "Platinum"
       })
+    (ok true)
+  )
+)
+
+(define-public (register-stakeholder (role-type (string-ascii 20)))
+  (begin
+    (map-set stakeholder-roles { stakeholder: tx-sender }
+      {
+        role-type: role-type,
+        verified: false,
+        registered-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (verify-stakeholder (stakeholder principal))
+  (let
+    (
+      (role-info (unwrap! (map-get? stakeholder-roles { stakeholder: stakeholder }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set stakeholder-roles { stakeholder: stakeholder }
+      (merge role-info { verified: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (subscribe-to-policy 
+  (policy-id uint) 
+  (notification-types (list 10 uint))
+)
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (stakeholder-info (map-get? stakeholder-roles { stakeholder: tx-sender }))
+    )
+    (asserts! (is-some stakeholder-info) err-unauthorized)
+    (asserts! (get verified (unwrap-panic stakeholder-info)) err-unauthorized)
+    (asserts! (not (is-some (map-get? stakeholder-subscriptions { stakeholder: tx-sender, policy-id: policy-id }))) err-notification-exists)
+    
+    (map-set stakeholder-subscriptions { stakeholder: tx-sender, policy-id: policy-id }
+      {
+        notification-types: notification-types,
+        active: true,
+        subscribed-at: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (unsubscribe-from-policy (policy-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? stakeholder-subscriptions { stakeholder: tx-sender, policy-id: policy-id }) err-notification-not-found))
+    )
+    (map-set stakeholder-subscriptions { stakeholder: tx-sender, policy-id: policy-id }
+      (merge subscription { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (mark-notification-read (notification-id uint))
+  (let
+    (
+      (notification (unwrap! (map-get? notifications { notification-id: notification-id }) err-notification-not-found))
+    )
+    (asserts! (is-eq tx-sender (get stakeholder notification)) err-unauthorized)
+    (map-set notifications { notification-id: notification-id }
+      (merge notification { read: true })
+    )
+    (ok true)
+  )
+)
+
+(define-private (create-notification 
+  (policy-id uint) 
+  (notification-type uint) 
+  (stakeholder principal) 
+  (message (string-ascii 100))
+)
+  (let
+    (
+      (notification-id (+ (var-get notification-counter) u1))
+    )
+    (map-set notifications { notification-id: notification-id }
+      {
+        policy-id: policy-id,
+        notification-type: notification-type,
+        stakeholder: stakeholder,
+        message: message,
+        created-at: stacks-block-height,
+        read: false
+      }
+    )
+    (var-set notification-counter notification-id)
+    notification-id
+  )
+)
+
+(define-private (notify-stakeholders (policy-id uint) (notification-type uint) (message (string-ascii 100)))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    )
+    (create-notification policy-id notification-type (get shipper policy) message)
+    (create-notification policy-id notification-type (get receiver policy) message)
+    (ok true)
+  )
+)
+
+(define-private (notify-subscribed-stakeholders (policy-id uint) (notification-type uint) (message (string-ascii 100)))
+  (begin
+    (unwrap-panic (notify-stakeholders policy-id notification-type message))
     (ok true)
   )
 )
@@ -196,6 +356,7 @@
     
     (var-set policy-counter policy-id)
     (var-set total-locked-funds (+ (var-get total-locked-funds) discounted-premium))
+    (unwrap-panic (notify-stakeholders policy-id notification-type-policy-created "Policy created successfully"))
     (ok policy-id)
   )
 )
@@ -232,6 +393,7 @@
     )
     
     (var-set claim-counter claim-id)
+    (unwrap-panic (notify-stakeholders policy-id notification-type-claim-submitted "New claim submitted"))
     (ok claim-id)
   )
 )
@@ -263,13 +425,17 @@
           })
         )
         (var-set total-locked-funds (- (var-get total-locked-funds) (get claim-amount claim)))
+        (unwrap-panic (notify-stakeholders policy-id notification-type-claim-approved "Claim approved and processed"))
       )
-      (map-set claims
-        { claim-id: claim-id }
-        (merge claim { 
-          status: claim-status-rejected,
-          processed-at: (some stacks-block-height)
-        })
+      (begin
+        (map-set claims
+          { claim-id: claim-id }
+          (merge claim { 
+            status: claim-status-rejected,
+            processed-at: (some stacks-block-height)
+          })
+        )
+        (unwrap-panic (notify-stakeholders policy-id notification-type-claim-rejected "Claim has been rejected"))
       )
     )
     (ok approved)
@@ -293,6 +459,7 @@
     )
     
     (var-set total-locked-funds (- (var-get total-locked-funds) (get locked-amount premium-info)))
+    (unwrap-panic (notify-stakeholders policy-id notification-type-policy-cancelled "Policy has been cancelled"))
     (ok true)
   )
 )
@@ -314,6 +481,7 @@
     )
     
     (var-set total-locked-funds (- (var-get total-locked-funds) (get locked-amount premium-info)))
+    (unwrap-panic (notify-stakeholders policy-id notification-type-policy-expired "Policy has expired"))
     (ok true)
   )
 )
@@ -331,6 +499,7 @@
     (if (and delivered on-time)
       (begin
         (try! (process-successful-delivery policy-id))
+        (unwrap-panic (notify-stakeholders policy-id notification-type-delivery-confirmed "Delivery confirmed successfully"))
         (expire-policy policy-id)
       )
       (begin
@@ -569,4 +738,23 @@
 
 (define-read-only (get-max-discount-rate)
   (var-get max-discount-rate)
+)
+
+(define-read-only (get-notification (notification-id uint))
+  (map-get? notifications { notification-id: notification-id })
+)
+
+(define-read-only (get-stakeholder-role (stakeholder principal))
+  (map-get? stakeholder-roles { stakeholder: stakeholder })
+)
+
+(define-read-only (get-stakeholder-subscription (stakeholder principal) (policy-id uint))
+  (map-get? stakeholder-subscriptions { stakeholder: stakeholder, policy-id: policy-id })
+)
+
+(define-read-only (get-notification-stats)
+  {
+    total-notifications: (var-get notification-counter),
+    total-stakeholders: u0
+  }
 )
