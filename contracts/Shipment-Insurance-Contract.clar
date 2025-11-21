@@ -12,6 +12,8 @@
 (define-constant err-notification-exists (err u110))
 (define-constant err-notification-not-found (err u111))
 (define-constant err-invalid-notification-type (err u112))
+(define-constant err-invalid-transfer (err u113))
+(define-constant err-transfer-not-authorized (err u114))
 
 (define-constant policy-status-active u1)
 (define-constant policy-status-claimed u2)
@@ -34,6 +36,7 @@
 (define-constant notification-type-claim-rejected u5)
 (define-constant notification-type-delivery-confirmed u6)
 (define-constant notification-type-policy-cancelled u7)
+(define-constant notification-type-policy-transferred u8)
 
 (define-data-var policy-counter uint u0)
 (define-data-var claim-counter uint u0)
@@ -136,6 +139,15 @@
     role-type: (string-ascii 20),
     verified: bool,
     registered-at: uint
+  }
+)
+
+(define-map policy-transfer-approvals
+  { policy-id: uint, from: principal, to: principal }
+  {
+    approved: bool,
+    initiated-at: uint,
+    expires-at: uint
   }
 )
 
@@ -757,4 +769,105 @@
     total-notifications: (var-get notification-counter),
     total-stakeholders: u0
   }
+)
+
+(define-public (initiate-policy-transfer (policy-id uint) (new-shipper principal) (transfer-duration uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (expires-at (+ stacks-block-height transfer-duration))
+    )
+    (asserts! (is-eq tx-sender (get shipper policy)) err-unauthorized)
+    (asserts! (is-eq (get status policy) policy-status-active) err-invalid-policy)
+    (asserts! (not (is-eq tx-sender new-shipper)) err-invalid-transfer)
+    (asserts! (<= stacks-block-height (get end-block policy)) err-policy-expired)
+    
+    (map-set policy-transfer-approvals
+      { policy-id: policy-id, from: tx-sender, to: new-shipper }
+      {
+        approved: false,
+        initiated-at: stacks-block-height,
+        expires-at: expires-at
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (approve-policy-transfer (policy-id uint) (from-principal principal))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (transfer-request (unwrap! (map-get? policy-transfer-approvals { policy-id: policy-id, from: from-principal, to: tx-sender }) err-not-found))
+    )
+    (asserts! (is-eq (get status policy) policy-status-active) err-invalid-policy)
+    (asserts! (<= stacks-block-height (get expires-at transfer-request)) err-policy-expired)
+    (asserts! (is-eq from-principal (get shipper policy)) err-transfer-not-authorized)
+    
+    (map-set policy-transfer-approvals
+      { policy-id: policy-id, from: from-principal, to: tx-sender }
+      (merge transfer-request { approved: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-policy-transfer (policy-id uint) (to-principal principal))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (transfer-request (unwrap! (map-get? policy-transfer-approvals { policy-id: policy-id, from: tx-sender, to: to-principal }) err-not-found))
+      (old-shipper-stats (default-to 
+        { successful-deliveries: u0, total-policies: u0, total-premium-paid: u0, current-tier: tier-bronze, last-updated: u0 }
+        (map-get? user-loyalty-stats { user: tx-sender })
+      ))
+      (new-shipper-stats (default-to 
+        { successful-deliveries: u0, total-policies: u0, total-premium-paid: u0, current-tier: tier-bronze, last-updated: u0 }
+        (map-get? user-loyalty-stats { user: to-principal })
+      ))
+    )
+    (asserts! (is-eq tx-sender (get shipper policy)) err-unauthorized)
+    (asserts! (is-eq (get status policy) policy-status-active) err-invalid-policy)
+    (asserts! (get approved transfer-request) err-transfer-not-authorized)
+    (asserts! (<= stacks-block-height (get expires-at transfer-request)) err-policy-expired)
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { shipper: to-principal })
+    )
+    
+    (map-set user-loyalty-stats { user: tx-sender }
+      (merge old-shipper-stats {
+        total-policies: (if (> (get total-policies old-shipper-stats) u0) (- (get total-policies old-shipper-stats) u1) u0),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (map-set user-loyalty-stats { user: to-principal }
+      (merge new-shipper-stats {
+        total-policies: (+ (get total-policies new-shipper-stats) u1),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (map-delete policy-transfer-approvals { policy-id: policy-id, from: tx-sender, to: to-principal })
+    (unwrap-panic (notify-stakeholders policy-id notification-type-policy-transferred "Policy ownership transferred"))
+    (ok true)
+  )
+)
+
+(define-public (cancel-policy-transfer (policy-id uint) (to-principal principal))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (transfer-request (unwrap! (map-get? policy-transfer-approvals { policy-id: policy-id, from: tx-sender, to: to-principal }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get shipper policy)) err-unauthorized)
+    (map-delete policy-transfer-approvals { policy-id: policy-id, from: tx-sender, to: to-principal })
+    (ok true)
+  )
+)
+
+(define-read-only (get-transfer-request (policy-id uint) (from-principal principal) (to-principal principal))
+  (map-get? policy-transfer-approvals { policy-id: policy-id, from: from-principal, to: to-principal })
 )
